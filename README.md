@@ -201,7 +201,8 @@
             "names": null
         }
     }
-}```
+}
+```
 
 #Step 2:Defining training configs and running training
 a. LiberoInputs and LiberoOutputs: Defines the data mapping from the LIBERO environment to the model and vice versa. Will be used for both, training and inference.
