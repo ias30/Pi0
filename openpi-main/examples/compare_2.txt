@@ -1,0 +1,880 @@
+=====================================================================================
+数据处理流程详细对比：offline_inference.py vs realman_inference.py
+从原始数据到 model.sample_actions(observation) 的完整步骤
+=====================================================================================
+
+目录：
+1. offline_inference.py 数据流程
+2. realman_inference.py 数据流程
+3. Transform Pipeline 详细说明
+4. 关键差异总结
+
+=====================================================================================
+1. OFFLINE_INFERENCE.PY 数据流程
+=====================================================================================
+
+步骤 1: 加载数据集 (load_episode_data)
+-------------------------------------------
+位置: offline_inference.py, line 121-162
+
+1.1 创建 LeRobotDataset
+    - 输入: dataset_path, episode_index, action_horizon
+    - 配置 delta_timestamps: {"action": [t/fps for t in range(action_horizon)]}
+    
+1.2 从数据集加载单帧数据
+    frame 结构 (从 LeRobot dataset):
+    {
+        "observation.state": np.ndarray,              # shape: (12,), dtype: float32, 单位: radians
+        "observation.images.cam_high": np.ndarray,    # shape: (480, 640, 3), dtype: uint8, format: RGB, HWC
+        "observation.images.cam_left_wrist": np.ndarray,  # shape: (480, 640, 3), dtype: uint8, RGB, HWC
+        "observation.images.cam_right_wrist": np.ndarray, # shape: (480, 640, 3), dtype: uint8, RGB, HWC
+        "action": np.ndarray,                         # shape: (action_horizon, 12), dtype: float32, radians
+        "prompt": str or np.ndarray,                  # 文本提示
+        "episode_index": int,
+        "task_index": int,
+        ... (其他元数据)
+    }
+
+
+步骤 2: 运行推理循环 (run_inference)
+-------------------------------------------
+位置: offline_inference.py, line 165-275
+
+2.1 批处理准备
+    for frame in batch_frames:
+        transformed = input_transform(frame)  # 见步骤 3
+
+
+步骤 3: 应用 Input Transform Pipeline
+-------------------------------------------
+位置: offline_inference.py, line 201 (调用), line 103-108 (定义)
+
+Input Transform Pipeline 组成:
+  input_transforms = compose([
+      *data_config.repack_transforms.inputs,      # 步骤 3.1
+      *data_config.data_transforms.inputs,        # 步骤 3.2
+      Normalize(norm_stats),                      # 步骤 3.3
+      *data_config.model_transforms.inputs,       # 步骤 3.4
+  ])
+
+3.1 RepackTransform (repack_transforms.inputs)
+    位置: config.py line 304-314, transforms.py line 80-116
+    
+    输入 frame:
+    {
+        "observation.state": (12,), float32
+        "observation.images.cam_high": (480, 640, 3), uint8, RGB, HWC
+        "observation.images.cam_left_wrist": (480, 640, 3), uint8, RGB, HWC
+        "observation.images.cam_right_wrist": (480, 640, 3), uint8, RGB, HWC
+        "action": (action_horizon, 12), float32
+        "prompt": str
+    }
+    
+    操作:
+    - 扁平化 dictionary (flatten_dict)
+    - 重新映射键名:
+      "observation.images.cam_high" -> "images/cam_high"
+      "observation.images.cam_left_wrist" -> "images/cam_left_wrist"
+      "observation.images.cam_right_wrist" -> "images/cam_right_wrist"
+      "observation.state" -> "state"
+      "action" -> "actions"
+    
+    输出 data:
+    {
+        "images": {
+            "cam_high": (480, 640, 3), uint8, RGB, HWC
+            "cam_left_wrist": (480, 640, 3), uint8, RGB, HWC
+            "cam_right_wrist": (480, 640, 3), uint8, RGB, HWC
+        },
+        "state": (12,), float32, radians
+        "actions": (action_horizon, 12), float32, radians
+        "prompt": str
+    }
+
+3.2 RealmanInputs (data_transforms.inputs)
+    位置: realman_policy.py line 24-88
+    
+    操作:
+    a) _decode_realman (line 107-138):
+       - state 保持不变: (12,), float32
+       - images 转换:
+         对每个图像: convert_image(img)
+           - einops.rearrange(img, "c h w -> h w c")
+           由于输入已经是 HWC 格式，这里是 identity 操作
+         结果: images 保持 (480, 640, 3), uint8, RGB, HWC
+    
+    b) 重新打包为 pi0 格式:
+       images 映射:
+       - "cam_high" -> "base_0_rgb"
+       - "cam_left_wrist" -> "left_wrist_0_rgb"
+       - "cam_right_wrist" -> "right_wrist_0_rgb"
+       
+       image_masks 创建:
+       - "base_0_rgb": True
+       - "left_wrist_0_rgb": True
+       - "right_wrist_0_rgb": True
+    
+    输出 data:
+    {
+        "image": {
+            "base_0_rgb": (480, 640, 3), uint8, RGB, HWC
+            "left_wrist_0_rgb": (480, 640, 3), uint8, RGB, HWC
+            "right_wrist_0_rgb": (480, 640, 3), uint8, RGB, HWC
+        },
+        "image_mask": {
+            "base_0_rgb": True (numpy bool)
+            "left_wrist_0_rgb": True
+            "right_wrist_0_rgb": True
+        },
+        "state": (12,), float32, radians
+        "actions": (action_horizon, 12), float32, radians
+        "prompt": str
+    }
+
+3.3 DeltaActions (data_transforms.inputs, if use_delta_joint_actions=True)
+    位置: transforms.py line 227-245
+    
+    操作:
+    - mask = [True, True, ..., True]  # 12个True，对所有关节应用delta
+    - actions[..., :12] -= expand_dims(where(mask, state[..., :12], 0), axis=-2)
+    - 即: actions = actions - state (对前12维)
+    
+    输入:
+    - state: (12,), float32
+    - actions: (action_horizon, 12), float32
+    
+    输出 data["actions"]:
+    - (action_horizon, 12), float32, delta actions (相对于当前state的增量)
+
+3.4 Normalize (norm_stats, use_quantiles=False)
+    位置: transforms.py line 129-167
+    
+    操作: apply_tree 对 data 中的每个字段应用归一化
+    - 查找 norm_stats 中对应的统计信息
+    - z-score normalization: (x - mean) / (std + 1e-6)
+    
+    归一化的字段:
+    - state: (12,) -> (12,), float32, normalized
+    - actions: (action_horizon, 12) -> (action_horizon, 12), float32, normalized
+    - image 字段不归一化（norm_stats 中没有 image 相关的统计）
+    
+    输出 data:
+    {
+        "image": {维持不变},
+        "image_mask": {维持不变},
+        "state": (12,), float32, normalized
+        "actions": (action_horizon, 12), float32, normalized delta actions
+        "prompt": str
+    }
+
+3.5 InjectDefaultPrompt (model_transforms.inputs)
+    位置: transforms.py line 120-126, config.py line 150
+    
+    操作:
+    - 如果 data 中没有 "prompt"，注入默认 prompt
+    - 本例中已有 prompt，跳过
+    
+    输出: data 不变
+
+3.6 ResizeImages (model_transforms.inputs)
+    位置: transforms.py line 199-214, config.py line 151
+    
+    操作:
+    - height=224, width=224
+    - 对 data["image"] 中的每个图像调用 image_tools.resize_with_pad
+    
+    resize_with_pad 详细步骤 (image_tools.py line 15-35):
+    a) 输入: (480, 640, 3), uint8, HWC
+    b) reshape: (-1, 480, 640, 3) = (1, 480, 640, 3)
+    c) 对每个图像:
+       - Image.fromarray(im)  # PIL Image
+       - _resize_with_pad_pil(image, 224, 224):
+         * 计算 ratio = max(640/224, 480/224) = max(2.857, 2.143) = 2.857
+         * resized_height = int(480/2.857) = 168
+         * resized_width = int(640/2.857) = 224
+         * resize to (224, 168)
+         * create black canvas (224, 224)
+         * pad_height = (224-168)/2 = 28
+         * pad_width = (224-224)/2 = 0
+         * paste at (0, 28)
+       - 返回 (224, 224, 3), uint8
+    d) stack: (1, 224, 224, 3)
+    e) reshape back: (224, 224, 3)
+    
+    输出 data["image"]:
+    {
+        "base_0_rgb": (224, 224, 3), uint8, RGB, HWC, with padding
+        "left_wrist_0_rgb": (224, 224, 3), uint8, RGB, HWC, with padding
+        "right_wrist_0_rgb": (224, 224, 3), uint8, RGB, HWC, with padding
+    }
+
+3.7 TokenizeFASTInputs (model_transforms.inputs)
+    位置: transforms.py line 293-311, config.py line 152-154
+    
+    操作:
+    - 提取并删除 prompt: data.pop("prompt")
+    - state, actions = data["state"], data.get("actions")
+    - 调用 tokenizer.tokenize(prompt, state, actions)
+      返回: tokens, token_mask, ar_mask, loss_mask
+    
+    输出 data:
+    {
+        "image": {同上},
+        "image_mask": {同上},
+        "state": (12,), float32, normalized
+        "actions": (action_horizon, 12), float32, normalized delta
+        "tokenized_prompt": tokens (array)
+        "tokenized_prompt_mask": token_mask (array)
+        "token_ar_mask": ar_mask (array)
+        "token_loss_mask": loss_mask (array)
+    }
+
+步骤 3 总结 - transformed 输出:
+{
+    "image": {
+        "base_0_rgb": (224, 224, 3), uint8, RGB, HWC
+        "left_wrist_0_rgb": (224, 224, 3), uint8, RGB, HWC
+        "right_wrist_0_rgb": (224, 224, 3), uint8, RGB, HWC
+    },
+    "image_mask": {
+        "base_0_rgb": True
+        "left_wrist_0_rgb": True
+        "right_wrist_0_rgb": True
+    },
+    "state": (12,), float32, normalized
+    "actions": (action_horizon, 12), float32, normalized delta
+    "tokenized_prompt": array
+    "tokenized_prompt_mask": array
+    "token_ar_mask": array
+    "token_loss_mask": array
+}
+
+
+步骤 4: 创建 Batch
+-------------------------------------------
+位置: offline_inference.py, line 207
+
+操作:
+    batch = jax.tree.map(lambda *xs: np.stack(xs, axis=0), *batch_data)
+    
+说明:
+- batch_data 是 list[transformed]，长度为 batch_size (例如 2)
+- jax.tree.map 对每个字段的所有样本进行 stack
+- 在 axis=0 添加 batch 维度
+
+输出 batch 结构 (batch_size=2):
+{
+    "image": {
+        "base_0_rgb": (2, 224, 224, 3), uint8
+        "left_wrist_0_rgb": (2, 224, 224, 3), uint8
+        "right_wrist_0_rgb": (2, 224, 224, 3), uint8
+    },
+    "image_mask": {
+        "base_0_rgb": (2,), bool
+        "left_wrist_0_rgb": (2,), bool
+        "right_wrist_0_rgb": (2,), bool
+    },
+    "state": (2, 12), float32, normalized
+    "actions": (2, action_horizon, 12), float32, normalized delta
+    "tokenized_prompt": (2, ...), array
+    "tokenized_prompt_mask": (2, ...), array
+    "token_ar_mask": (2, ...), array
+    "token_loss_mask": (2, ...), array
+}
+
+
+步骤 5: 转换为 JAX Arrays
+-------------------------------------------
+位置: offline_inference.py, line 215
+
+操作:
+    batch = jax.tree.map(lambda x: jnp.asarray(x), batch)
+
+说明:
+- 将所有 numpy arrays 转换为 JAX DeviceArray
+- dtype 和 shape 保持不变
+- 数据可能被移动到 GPU (如果可用)
+
+输出: batch (所有 numpy arrays -> JAX arrays)
+
+
+步骤 6: 创建 Observation
+-------------------------------------------
+位置: offline_inference.py, line 218
+
+操作:
+    observation = _model.Observation.from_dict(batch)
+
+说明:
+- Observation.from_dict 从字典创建 Observation dataclass
+- 提取必要的字段: images, image_masks, state, tokenized_prompt, etc.
+
+最终 observation 结构:
+    Observation(
+        images: dict[str, Array] = {
+            "base_0_rgb": (2, 224, 224, 3), uint8, JAX array
+            "left_wrist_0_rgb": (2, 224, 224, 3), uint8, JAX array
+            "right_wrist_0_rgb": (2, 224, 224, 3), uint8, JAX array
+        },
+        image_masks: dict[str, Array] = {
+            "base_0_rgb": (2,), bool, JAX array
+            "left_wrist_0_rgb": (2,), bool, JAX array
+            "right_wrist_0_rgb": (2,), bool, JAX array
+        },
+        state: (2, 12), float32, normalized, JAX array
+        tokenized_prompt: (2, ...), JAX array
+        tokenized_prompt_mask: (2, ...), JAX array
+        token_ar_mask: (2, ...), JAX array
+        token_loss_mask: (2, ...), JAX array
+    )
+
+
+步骤 7: 模型推理
+-------------------------------------------
+位置: offline_inference.py, line 237-241
+
+调用:
+    predicted_actions = model.sample_actions(
+        inference_rng, 
+        observation,    # <- 这是传入模型的最终 observation
+        num_steps=10
+    )
+
+observation 此时的完整状态见步骤 6。
+
+
+=====================================================================================
+2. REALMAN_INFERENCE.PY 数据流程
+=====================================================================================
+
+步骤 1: 获取机械臂状态 (_get_current_state)
+-------------------------------------------
+位置: realman_inference.py, line 322-380
+
+1.1 获取关节角度
+    位置: line 330-343
+    
+    操作:
+    a) 从机械臂读取状态:
+       - left_result, left_state = self.left_arm.rm_get_current_arm_state()
+       - right_result, right_state = self.right_arm.rm_get_current_arm_state()
+    
+    b) 提取关节角度:
+       - left_joints_deg = np.array(left_state['joint'][:6])   # (6,), float, 度
+       - right_joints_deg = np.array(right_state['joint'][:6])  # (6,), float, 度
+    
+    c) 转换为弧度:
+       - left_joints_rad = deg_to_rad(left_joints_deg)   # (6,), float, 弧度
+       - right_joints_rad = deg_to_rad(right_joints_deg) # (6,), float, 弧度
+       deg_to_rad 定义: np.deg2rad(angles_deg)
+    
+    d) 拼接:
+       - state_rad = np.concatenate([right_joints_rad, left_joints_rad])
+       结果: (12,), dtype 取决于 deg_to_rad 输出 (通常 float64)
+
+
+1.2 获取相机图像
+    位置: line 348-353
+    
+    操作:
+    - _, cam_high_img, _ = self.camera_collector.camera_high.get_latest_data()
+    - _, cam_left_wrist_img = self.camera_collector.camera_left_wrist.get_latest_data()
+    - _, cam_right_wrist_img = self.camera_collector.camera_right_wrist.get_latest_data()
+    
+    输出:
+    - cam_high_img: (480, 640, 3), uint8, BGR, HWC (OpenCV format)
+    - cam_left_wrist_img: (480, 640, 3), uint8, BGR, HWC
+    - cam_right_wrist_img: (480, 640, 3), uint8, BGR, HWC
+
+
+1.3 图像预处理 (preprocess_image)
+    位置: line 357-359, 定义在 line 88-112
+    
+    preprocess_image 详细步骤:
+    
+    输入: image_bgr
+    - shape: (480, 640, 3), dtype: uint8, format: BGR, HWC
+    
+    操作 a) BGR -> RGB 转换:
+    - image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    - 结果: (480, 640, 3), uint8, RGB, HWC
+    
+    操作 b) HWC -> CHW 转置:
+    - image_chw = np.transpose(image_rgb, (2, 0, 1))
+    - 结果: (3, 480, 640), uint8, RGB, CHW
+    
+    输出:
+    - cam_high_processed: (3, 480, 640), uint8, RGB, CHW
+    - cam_left_wrist_processed: (3, 480, 640), uint8, RGB, CHW
+    - cam_right_wrist_processed: (3, 480, 640), uint8, RGB, CHW
+
+
+1.4 创建 placeholder action
+    位置: line 365
+    
+    操作:
+    - placeholder_action = np.zeros((self.train_config.model.action_horizon, 12), dtype=np.float32)
+    - shape: (action_horizon, 12), dtype: float32
+    - 用途: transforms 需要 action 字段，但推理时不使用真实值
+
+
+1.5 组装 state_dict
+    位置: line 368-380
+    
+    输出 state_dict:
+    {
+        "observation.state": (12,), dtype取决于np.deg2rad (通常float64), 弧度
+        "action": (action_horizon, 12), float32, zeros
+        "observation.images.cam_high": (3, 480, 640), uint8, RGB, CHW
+        "observation.images.cam_left_wrist": (3, 480, 640), uint8, RGB, CHW
+        "observation.images.cam_right_wrist": (3, 480, 640), uint8, RGB, CHW
+        "prompt": str ("Let the forceps go along the black S shaped path")
+        "raw_images": {原始BGR图像，不用于推理}
+    }
+
+
+步骤 2: 应用 Input Transform Pipeline (_run_inference)
+-------------------------------------------
+位置: realman_inference.py, line 382-449
+
+2.1 调用 input_transform
+    位置: line 394
+    
+    操作:
+    transformed = self.input_transform(state_dict)
+    
+    self.input_transform 的构成与 offline_inference 相同（步骤 3）:
+    - repack_transforms.inputs
+    - data_transforms.inputs
+    - Normalize
+    - model_transforms.inputs
+
+
+步骤 2.1: RepackTransform (与 offline 相同)
+-------------------------------------------
+位置: config.py line 304-314, transforms.py line 80-116
+
+输入 state_dict:
+{
+    "observation.state": (12,), float64, 弧度
+    "action": (action_horizon, 12), float32, zeros
+    "observation.images.cam_high": (3, 480, 640), uint8, RGB, CHW
+    "observation.images.cam_left_wrist": (3, 480, 640), uint8, RGB, CHW
+    "observation.images.cam_right_wrist": (3, 480, 640), uint8, RGB, CHW
+    "prompt": str
+}
+
+操作:
+- 扁平化并重新映射键名（同 offline）
+
+输出 data:
+{
+    "images": {
+        "cam_high": (3, 480, 640), uint8, RGB, CHW
+        "cam_left_wrist": (3, 480, 640), uint8, RGB, CHW
+        "cam_right_wrist": (3, 480, 640), uint8, RGB, CHW
+    },
+    "state": (12,), float64, 弧度
+    "actions": (action_horizon, 12), float32, zeros
+    "prompt": str
+}
+
+
+步骤 2.2: RealmanInputs (data_transforms.inputs) **关键差异**
+-------------------------------------------
+位置: realman_policy.py line 24-88
+
+操作:
+a) _decode_realman (line 107-138):
+   - state 保持不变: (12,), float64
+   - images 转换:
+     对每个图像: convert_image(img)
+       输入: (3, 480, 640), uint8, RGB, CHW
+       操作: einops.rearrange(img, "c h w -> h w c")
+       输出: (480, 640, 3), uint8, RGB, HWC
+     
+     **关键**: 这里将 CHW -> HWC，与 offline 中 HWC -> HWC 不同
+     
+   结果: images 转换为 (480, 640, 3), uint8, RGB, HWC
+
+b) 重新打包为 pi0 格式（同 offline）:
+   images 映射:
+   - "cam_high" -> "base_0_rgb"
+   - "cam_left_wrist" -> "left_wrist_0_rgb"
+   - "cam_right_wrist" -> "right_wrist_0_rgb"
+   
+   image_masks 创建:
+   - 所有设置为 True
+
+输出 data:
+{
+    "image": {
+        "base_0_rgb": (480, 640, 3), uint8, RGB, HWC
+        "left_wrist_0_rgb": (480, 640, 3), uint8, RGB, HWC
+        "right_wrist_0_rgb": (480, 640, 3), uint8, RGB, HWC
+    },
+    "image_mask": {
+        "base_0_rgb": True
+        "left_wrist_0_rgb": True
+        "right_wrist_0_rgb": True
+    },
+    "state": (12,), float64, 弧度
+    "actions": (action_horizon, 12), float32, zeros
+    "prompt": str
+}
+
+
+步骤 2.3: DeltaActions (data_transforms.inputs)
+-------------------------------------------
+位置: transforms.py line 227-245
+
+操作:
+- mask = [True] * 12
+- actions[..., :12] -= expand_dims(where(mask, state[..., :12], 0), axis=-2)
+- 对于 zeros action: actions = zeros - state = -state
+
+输入:
+- state: (12,), float64, 弧度
+- actions: (action_horizon, 12), float32, zeros
+
+输出 data["actions"]:
+- (action_horizon, 12), float32 (广播转换), 值为 -state 的重复
+
+
+步骤 2.4: Normalize (norm_stats, use_quantiles=False)
+-------------------------------------------
+位置: transforms.py line 129-167
+
+操作: 同 offline
+- state 归一化: (x - mean) / (std + 1e-6)
+- actions 归一化: (x - mean) / (std + 1e-6)
+
+输入:
+- state: (12,), float64, 弧度
+- actions: (action_horizon, 12), float32, -state 的重复
+
+输出 data:
+{
+    "image": {不变},
+    "image_mask": {不变},
+    "state": (12,), float32 or float64, normalized
+    "actions": (action_horizon, 12), float32, normalized (-state)
+    "prompt": str
+}
+
+
+步骤 2.5: InjectDefaultPrompt (model_transforms.inputs)
+-------------------------------------------
+位置: transforms.py line 120-126
+
+操作: 已有 prompt，跳过
+
+输出: data 不变
+
+
+步骤 2.6: ResizeImages (model_transforms.inputs) **与 offline 相同**
+-------------------------------------------
+位置: transforms.py line 199-214
+
+操作:
+- height=224, width=224
+- 对 data["image"] 中的每个图像调用 image_tools.resize_with_pad
+
+resize_with_pad 详细步骤（同 offline）:
+输入: (480, 640, 3), uint8, HWC
+处理: 同 offline 的步骤 3.6
+输出: (224, 224, 3), uint8, RGB, HWC, with padding
+
+输出 data["image"]:
+{
+    "base_0_rgb": (224, 224, 3), uint8, RGB, HWC
+    "left_wrist_0_rgb": (224, 224, 3), uint8, RGB, HWC
+    "right_wrist_0_rgb": (224, 224, 3), uint8, RGB, HWC
+}
+
+
+步骤 2.7: TokenizeFASTInputs (model_transforms.inputs)
+-------------------------------------------
+位置: transforms.py line 293-311
+
+操作: 同 offline
+- 提取并删除 prompt
+- 调用 tokenizer.tokenize(prompt, state, actions)
+
+输出 data:
+{
+    "image": {同上},
+    "image_mask": {同上},
+    "state": (12,), float32 or float64, normalized
+    "actions": (action_horizon, 12), float32, normalized (-state)
+    "tokenized_prompt": array
+    "tokenized_prompt_mask": array
+    "token_ar_mask": array
+    "token_loss_mask": array
+}
+
+
+步骤 2 总结 - transformed 输出:
+{
+    "image": {
+        "base_0_rgb": (224, 224, 3), uint8, RGB, HWC
+        "left_wrist_0_rgb": (224, 224, 3), uint8, RGB, HWC
+        "right_wrist_0_rgb": (224, 224, 3), uint8, RGB, HWC
+    },
+    "image_mask": {
+        "base_0_rgb": True
+        "left_wrist_0_rgb": True
+        "right_wrist_0_rgb": True
+    },
+    "state": (12,), float32 or float64, normalized
+    "actions": (action_horizon, 12), float32, normalized (值为归一化后的 -state)
+    "tokenized_prompt": array
+    "tokenized_prompt_mask": array
+    "token_ar_mask": array
+    "token_loss_mask": array
+}
+
+
+步骤 3: 添加 Batch 维度
+-------------------------------------------
+位置: realman_inference.py, line 397
+
+操作:
+    batch = jax.tree.map(lambda x: np.expand_dims(x, axis=0), transformed)
+
+说明:
+- 在 axis=0 添加 batch 维度
+- 单样本推理，batch_size = 1
+
+输出 batch 结构:
+{
+    "image": {
+        "base_0_rgb": (1, 224, 224, 3), uint8
+        "left_wrist_0_rgb": (1, 224, 224, 3), uint8
+        "right_wrist_0_rgb": (1, 224, 224, 3), uint8
+    },
+    "image_mask": {
+        "base_0_rgb": (1,), bool
+        "left_wrist_0_rgb": (1,), bool
+        "right_wrist_0_rgb": (1,), bool
+    },
+    "state": (1, 12), float32 or float64, normalized
+    "actions": (1, action_horizon, 12), float32, normalized
+    "tokenized_prompt": (1, ...), array
+    "tokenized_prompt_mask": (1, ...), array
+    "token_ar_mask": (1, ...), array
+    "token_loss_mask": (1, ...), array
+}
+
+
+步骤 4: 转换为 JAX Arrays
+-------------------------------------------
+位置: realman_inference.py, line 400
+
+操作:
+    batch = jax.tree.map(lambda x: jnp.asarray(x), batch)
+
+说明: 同 offline，将 numpy arrays 转换为 JAX arrays
+
+输出: batch (所有 numpy arrays -> JAX arrays)
+
+
+步骤 5: 创建 Observation
+-------------------------------------------
+位置: realman_inference.py, line 403
+
+操作:
+    observation = _model.Observation.from_dict(batch)
+
+最终 observation 结构:
+    Observation(
+        images: dict[str, Array] = {
+            "base_0_rgb": (1, 224, 224, 3), uint8, JAX array
+            "left_wrist_0_rgb": (1, 224, 224, 3), JAX array
+            "right_wrist_0_rgb": (1, 224, 224, 3), JAX array
+        },
+        image_masks: dict[str, Array] = {
+            "base_0_rgb": (1,), bool, JAX array
+            "left_wrist_0_rgb": (1,), bool, JAX array
+            "right_wrist_0_rgb": (1,), bool, JAX array
+        },
+        state: (1, 12), float32 or float64, normalized, JAX array
+        tokenized_prompt: (1, ...), JAX array
+        tokenized_prompt_mask: (1, ...), JAX array
+        token_ar_mask: (1, ...), JAX array
+        token_loss_mask: (1, ...), JAX array
+    )
+
+
+步骤 6: 保存前10帧 observation
+-------------------------------------------
+位置: realman_inference.py, line 406-420
+
+操作:
+- 提取 observation 数据 (转换为 numpy)
+- 保存到 self.observations_to_save 列表
+- 收集满10帧后保存到 realman_observations.pkl
+
+
+步骤 7: 模型推理
+-------------------------------------------
+位置: realman_inference.py, line 425-429
+
+调用:
+    predicted_actions = self.model.sample_actions(
+        inference_rng,
+        observation,    # <- 这是传入模型的最终 observation
+        num_steps=10
+    )
+
+observation 此时的完整状态见步骤 5。
+
+
+=====================================================================================
+3. TRANSFORM PIPELINE 详细说明
+=====================================================================================
+
+两个脚本使用相同的 Transform Pipeline，由以下组件构成:
+
+3.1 Repack Transforms (repack_transforms.inputs)
+    - RepackTransform: 重新映射键名
+
+3.2 Data Transforms (data_transforms.inputs)
+    - RealmanInputs: 处理 Realman 特定的数据格式
+      * _decode_realman: 图像格式转换 (CHW->HWC 或 HWC->HWC)
+      * 重新打包 images 和 image_masks
+    - DeltaActions: 将绝对动作转换为相对动作 (actions -= state)
+
+3.3 Normalize
+    - 对 state 和 actions 应用 z-score 归一化
+    - 使用预先计算的 norm_stats (mean, std)
+
+3.4 Model Transforms (model_transforms.inputs)
+    - InjectDefaultPrompt: 注入默认 prompt（如果需要）
+    - ResizeImages: 调整图像大小到 224x224，带 padding
+    - TokenizeFASTInputs: tokenize prompt, state, actions
+
+
+=====================================================================================
+4. 关键差异总结
+=====================================================================================
+
+4.1 原始数据来源
+-------------------------------------------
+offline_inference.py:
+  - 从 LeRobot dataset 加载
+  - images: (480, 640, 3), uint8, RGB, HWC
+  - state: (12,), float32, 弧度
+  - actions: (action_horizon, 12), float32, 弧度（真实值）
+
+realman_inference.py:
+  - 从机械臂和相机实时获取
+  - images: (480, 640, 3), uint8, BGR, HWC -> preprocess -> (3, 480, 640), uint8, RGB, CHW
+  - state: (12,), float64, 弧度
+  - actions: (action_horizon, 12), float32, zeros（占位符）
+
+
+4.2 图像预处理差异
+-------------------------------------------
+offline_inference.py:
+  - 数据集图像已经是 RGB, HWC 格式
+  - RepackTransform 后: (480, 640, 3), uint8, RGB, HWC
+  - RealmanInputs._decode_realman: einops.rearrange("c h w -> h w c") 是 identity (HWC->HWC)
+  - ResizeImages 输入: (480, 640, 3), uint8, HWC
+
+realman_inference.py:
+  - 相机图像是 BGR, HWC 格式
+  - preprocess_image: BGR->RGB, HWC->CHW
+  - RepackTransform 后: (3, 480, 640), uint8, RGB, CHW
+  - RealmanInputs._decode_realman: einops.rearrange("c h w -> h w c") 转换为 HWC (CHW->HWC)
+  - ResizeImages 输入: (480, 640, 3), uint8, HWC
+
+
+4.3 State dtype 差异
+-------------------------------------------
+offline_inference.py:
+  - 数据集中 state 是 float32
+
+realman_inference.py:
+  - np.deg2rad 返回 float64
+  - 可能在后续归一化中转换为 float32
+
+
+4.4 Actions 差异
+-------------------------------------------
+offline_inference.py:
+  - actions 是真实的目标动作
+  - DeltaActions: actions = actions - state (计算增量)
+  - 归一化后传入模型
+
+realman_inference.py:
+  - actions 是 zeros 占位符
+  - DeltaActions: actions = zeros - state = -state
+  - 归一化后传入模型
+  - 注意: actions 字段在推理时不被模型使用（仅用于训练）
+
+
+4.5 Batch Size 差异
+-------------------------------------------
+offline_inference.py:
+  - batch_size 可配置（例如 2）
+  - 多帧并行推理
+
+realman_inference.py:
+  - batch_size = 1
+  - 单帧实时推理
+
+
+4.6 最终 Observation 对比
+-------------------------------------------
+除了 batch_size 和 state dtype 可能的差异外，传入 model.sample_actions 的 observation 结构相同:
+
+Observation(
+    images: {
+        "base_0_rgb": (B, 224, 224, 3), uint8, JAX array, RGB, HWC, with padding
+        "left_wrist_0_rgb": (B, 224, 224, 3), uint8, JAX array
+        "right_wrist_0_rgb": (B, 224, 224, 3), JAX array
+    },
+    image_masks: {
+        "base_0_rgb": (B,), bool, JAX array
+        "left_wrist_0_rgb": (B,), bool, JAX array
+        "right_wrist_0_rgb": (B,), bool, JAX array
+    },
+    state: (B, 12), float32, normalized, JAX array
+    tokenized_prompt: (B, ...), JAX array
+    tokenized_prompt_mask: (B, ...), JAX array
+    token_ar_mask: (B, ...), JAX array
+    token_loss_mask: (B, ...), JAX array
+)
+
+其中 B = batch_size (offline: 2, realman: 1)
+
+
+4.7 需要验证的潜在差异点
+-------------------------------------------
+1. state dtype: float32 vs float64 在归一化后是否一致
+2. 相机图像内容: 数据集图像 vs 实时相机图像的像素值是否匹配
+3. padding 一致性: 两个脚本的 resize_with_pad 应用相同的逻辑
+4. 归一化参数: 确保使用相同的 norm_stats
+5. tokenizer 行为: 相同的 prompt 应该产生相同的 tokens
+
+
+=====================================================================================
+验证建议
+=====================================================================================
+
+使用提供的 compare_observations.py 脚本对比保存的 observations:
+1. 检查 images 的像素值分布
+2. 检查 state 的归一化结果
+3. 检查 tokenized_prompt 是否完全一致
+4. 检查所有 image_masks 是否都为 True
+
+如果发现差异，重点检查:
+- norm_stats 是否一致
+- 相机图像质量和内容
+- state 的单位和数值范围
+- prompt 字符串是否完全相同
+
+=====================================================================================
+文档结束
+=====================================================================================
